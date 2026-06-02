@@ -1,0 +1,104 @@
+import { google } from 'googleapis';
+import type { VercelRequest, VercelResponse } from '@vercel/node';
+
+export default async function handler(req: VercelRequest, res: VercelResponse) {
+  try {
+    const oauth2Client = new google.auth.OAuth2(
+      process.env.GMAIL_CLIENT_ID as string,
+      process.env.GMAIL_CLIENT_SECRET as string
+    );
+
+    oauth2Client.setCredentials({
+      refresh_token: process.env.GMAIL_REFRESH_TOKEN as string
+    });
+
+    const gmail = google.gmail({ version: 'v1', auth: oauth2Client });
+
+    const query = 'newer_than:1d (infelizmente OR "não daremos andamento" OR "processo seletivo" OR "entrevista" OR "candidatura")';
+    
+    const listResponse = await gmail.users.messages.list({
+      userId: 'me',
+      q: query,
+      maxResults: 20
+    });
+
+    const messages = listResponse.data.messages || [];
+
+    if (messages.length === 0) {
+      await enviarTelegram('🔍 *Monitor de Vagas:* Nenhum e-mail de processos seletivos foi encontrado nas últimas 24 horas.');
+      return res.status(200).json({ status: 'success', data: 'Nenhum e-mail encontrado.' });
+    }
+
+    const listaResumos: string[] = [];
+    for (const msg of messages) {
+      const details = await gmail.users.messages.get({
+        userId: 'me',
+        id: msg.id!,
+        format: 'minimal' 
+      });
+      
+      if (details.data.snippet) {
+        listaResumos.push(`- Snippet: ${details.data.snippet}`);
+      }
+    }
+
+    const relatorioIA = await analisarComGemini(listaResumos.join('\n'));
+
+    await enviarTelegram(relatorioIA);
+
+    return res.status(200).json({ status: 'success', totalProcessado: messages.length });
+  } catch (error: any) {
+    console.error('Erro durante a execução do monitor:', error);
+    await enviarTelegram(`❌ *Erro no Monitor de Vagas:* ${error.message}`);
+    return res.status(500).json({ status: 'error', message: error.message });
+  }
+}
+
+async function analisarComGemini(textoEmails: string): Promise<string> {
+  const url = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${process.env.GEMINI_API_KEY}`;
+  
+  const prompt = `
+    Atue como um assistente de triagem de e-mails de recrutamento. Analise a seguinte lista de fragmentos de e-mails recebidos por um programador.
+    O seu objetivo único é gerar um resumo diário direto e limpo para ser enviado via Telegram.
+    
+    Classifique e agrupe as mensagens estritamente em três categorias, caso existam:
+    1. 🎉 **Avanços / Respostas Positivas:** (Convites para entrevistas, links de testes práticos, agendamentos).
+    2. ❌ **Negativas / Encerramentos:** (E-mails de agradecimento, recusas, processos encerrados).
+    3. ℹ️ **Confirmações / Alertas Gerais:** (Apenas avisos de novas vagas recebidas ou candidaturas submetidas com sucesso).
+
+    Regras cruciais:
+    - Se um e-mail for apenas publicidade ou newsletter genérica que não traga uma resposta concreta sobre uma candidatura dele, ignore por completo.
+    - Formate a resposta final usando Markdown padrão do Telegram (negritos, emojis e quebras de linha).
+    - Seja muito conciso e direto. Se não houver e-mails para uma determinada categoria, não a inclua no texto.
+
+    E-mails a analisar:
+    ${textoEmails}
+  `;
+
+  const response = await fetch(url, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      contents: [{ parts: [{ text: prompt }] }]
+    })
+  });
+
+  const json: any = await response.json();
+  return json.candidates?.[0]?.content?.parts?.[0]?.text || 'Não foi possível gerar o resumo com a IA.';
+}
+
+async function enviarTelegram(mensagem: string): Promise<void> {
+  const token = process.env.TELEGRAM_TOKEN;
+  const chatId = process.env.TELEGRAM_CHAT_ID;
+  const url = `https://api.telegram.org/bot${token}/sendMessage`;
+
+  await fetch(url, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      chat_id: chatId,
+      text: mensagem,
+      parse_mode: 'Markdown'
+    })
+  });
+}
